@@ -12,9 +12,11 @@ import (
 	"github.com/sagernet/bbolt"
 	bboltErrors "github.com/sagernet/bbolt/errors"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service/filemanager"
 )
 
@@ -30,6 +32,7 @@ var (
 		string(bucketMode),
 		string(bucketRuleSet),
 		string(bucketRDRC),
+		string(bucketDNSCache),
 	}
 
 	cacheIDDefault = []byte("default")
@@ -38,30 +41,44 @@ var (
 var _ adapter.CacheFile = (*CacheFile)(nil)
 
 type CacheFile struct {
-	ctx               context.Context
-	path              string
-	cacheID           []byte
-	storeFakeIP       bool
-	storeRDRC         bool
-	rdrcTimeout       time.Duration
-	DB                *bbolt.DB
-	resetAccess       sync.Mutex
-	saveMetadataTimer *time.Timer
-	saveFakeIPAccess  sync.RWMutex
-	saveDomain        map[netip.Addr]string
-	saveAddress4      map[string]netip.Addr
-	saveAddress6      map[string]netip.Addr
-	saveRDRCAccess    sync.RWMutex
-	saveRDRC          map[saveRDRCCacheKey]bool
+	ctx                context.Context
+	logger             logger.Logger
+	path               string
+	cacheID            []byte
+	cacheIDText        string
+	storeFakeIP        bool
+	storeRDRC          bool
+	storeDNS           bool
+	disableExpire      bool
+	rdrcTimeout        time.Duration
+	optimisticTimeout  time.Duration
+	DB                 *bbolt.DB
+	resetAccess        sync.Mutex
+	saveMetadataTimer  *time.Timer
+	saveFakeIPAccess   sync.RWMutex
+	saveDomain         map[netip.Addr]string
+	saveAddress4       map[string]netip.Addr
+	saveAddress6       map[string]netip.Addr
+	saveRDRCAccess     sync.RWMutex
+	saveRDRC           map[saveCacheKey]bool
+	saveDNSCacheAccess sync.RWMutex
+	saveDNSCache       map[saveCacheKey]saveDNSCacheEntry
 }
 
-type saveRDRCCacheKey struct {
+type saveCacheKey struct {
 	TransportName string
 	QuestionName  string
 	QType         uint16
 }
 
-func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
+type saveDNSCacheEntry struct {
+	rawMessage []byte
+	expireAt   time.Time
+	sequence   uint64
+	saving     bool
+}
+
+func New(ctx context.Context, logger logger.Logger, options option.CacheFileOptions) *CacheFile {
 	var path string
 	if options.Path != "" {
 		path = options.Path
@@ -71,6 +88,9 @@ func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
 	var cacheIDBytes []byte
 	if options.CacheID != "" {
 		cacheIDBytes = append([]byte{0}, []byte(options.CacheID)...)
+	}
+	if options.StoreRDRC {
+		deprecated.Report(ctx, deprecated.OptionStoreRDRC)
 	}
 	var rdrcTimeout time.Duration
 	if options.StoreRDRC {
@@ -82,15 +102,19 @@ func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
 	}
 	return &CacheFile{
 		ctx:          ctx,
+		logger:       logger,
 		path:         filemanager.BasePath(ctx, path),
 		cacheID:      cacheIDBytes,
+		cacheIDText:  options.CacheID,
 		storeFakeIP:  options.StoreFakeIP,
 		storeRDRC:    options.StoreRDRC,
+		storeDNS:     options.StoreDNS,
 		rdrcTimeout:  rdrcTimeout,
 		saveDomain:   make(map[netip.Addr]string),
 		saveAddress4: make(map[string]netip.Addr),
 		saveAddress6: make(map[string]netip.Addr),
-		saveRDRC:     make(map[saveRDRCCacheKey]bool),
+		saveRDRC:     make(map[saveCacheKey]bool),
+		saveDNSCache: make(map[saveCacheKey]saveDNSCacheEntry),
 	}
 }
 
@@ -102,16 +126,56 @@ func (c *CacheFile) Dependencies() []string {
 	return nil
 }
 
+func (c *CacheFile) CacheID() string {
+	return c.cacheIDText
+}
+
+func (c *CacheFile) SetOptimisticTimeout(timeout time.Duration) {
+	c.optimisticTimeout = timeout
+}
+
+func (c *CacheFile) SetDisableExpire(disableExpire bool) {
+	c.disableExpire = disableExpire
+}
+
 func (c *CacheFile) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateInitialize {
-		return nil
+	switch stage {
+	case adapter.StartStateInitialize:
+		return c.start()
+	case adapter.StartStateStart:
+		c.startCacheCleanup()
 	}
+	return nil
+}
+
+func (c *CacheFile) startCacheCleanup() {
+	if c.storeDNS {
+		c.clearRDRC()
+		c.cleanupDNSCache()
+		interval := c.optimisticTimeout / 2
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		go c.loopCacheCleanup(interval, c.cleanupDNSCache)
+	} else if c.storeRDRC {
+		c.cleanupRDRC()
+		interval := c.rdrcTimeout / 2
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		go c.loopCacheCleanup(interval, c.cleanupRDRC)
+	}
+}
+
+func (c *CacheFile) start() error {
 	const fileMode = 0o666
+	cacheFile, err := filemanager.OpenFile(c.ctx, c.path, os.O_RDWR|os.O_CREATE, fileMode)
+	if err != nil {
+		return err
+	}
+	cacheFile.Close()
 	options := bbolt.Options{Timeout: time.Second}
-	var (
-		db  *bbolt.DB
-		err error
-	)
+	var db *bbolt.DB
 	for range 10 {
 		db, err = bbolt.Open(c.path, fileMode, &options)
 		if err == nil {
@@ -121,7 +185,7 @@ func (c *CacheFile) Start(stage adapter.StartStage) error {
 			continue
 		}
 		if E.IsMulti(err, bboltErrors.ErrInvalid, bboltErrors.ErrChecksum, bboltErrors.ErrVersionMismatch) {
-			rmErr := os.Remove(c.path)
+			rmErr := filemanager.Remove(c.ctx, c.path)
 			if rmErr != nil {
 				return err
 			}
@@ -204,7 +268,7 @@ func (c *CacheFile) resetDB() {
 	c.resetAccess.Lock()
 	defer c.resetAccess.Unlock()
 	c.DB.Close()
-	os.Remove(c.path)
+	filemanager.Remove(c.ctx, c.path)
 	db, err := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
 	if err == nil {
 		_ = filemanager.Chown(c.ctx, c.path)
